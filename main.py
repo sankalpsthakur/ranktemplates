@@ -1,16 +1,27 @@
-from flask import Flask, request, jsonify
 import json
 import numpy as np
 import torch
 from transformers import CLIPModel, CLIPProcessor
+from flask import Flask, request, jsonify
+from google.cloud import storage
+import os
+import logging
 
 app = Flask(__name__)
 
-# Load model and processor once during app initialization
+# Initialize logging
+logging.basicConfig(level=logging.INFO)
+
+# Load model and processor once during cold start
 model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
 processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
-image_embeddings = None  # Placeholder for image embeddings
+# Placeholder for image embeddings
+image_embeddings = None
+
+# Environment variables for GCS
+BUCKET_NAME = os.getenv('BUCKET_NAME', 'lolify_embeddings')
+BLOB_NAME = os.getenv('BLOB_NAME', 'image_embeddings.json')
 
 def calculate_cosine_similarity(vec1, vec2):
     """Calculate the cosine similarity between two vectors."""
@@ -20,11 +31,22 @@ def calculate_cosine_similarity(vec1, vec2):
     return dot_product / (norm_vec1 * norm_vec2)
 
 def load_image_embeddings():
-    """Load image embeddings from the JSON file."""
+    """Load image embeddings from the JSON file in GCS."""
     global image_embeddings
     if image_embeddings is None:
-        with open('image_embeddings.json', 'r') as f:
-            image_embeddings = json.load(f)
+        # Initialize the GCS client
+        client = storage.Client()
+        bucket = client.bucket(BUCKET_NAME)
+        blob = bucket.blob(BLOB_NAME)
+        
+        try:
+            logging.info(f"Downloading {BLOB_NAME} from bucket {BUCKET_NAME}.")
+            image_embeddings_json = blob.download_as_text()
+            image_embeddings = json.loads(image_embeddings_json)
+            logging.info("Image embeddings loaded successfully.")
+        except Exception as e:
+            logging.error(f"Error loading image embeddings: {e}")
+            raise e
     return image_embeddings
 
 def create_prompt_embedding(prompt):
@@ -61,8 +83,12 @@ def rank_templates():
     if not prompt:
         return jsonify({"error": "Invalid input, 'prompt' is required"}), 400
 
-    prompt_embedding = create_prompt_embedding(prompt)
-    image_embeddings = load_image_embeddings()
+    try:
+        prompt_embedding = create_prompt_embedding(prompt)
+        image_embeddings = load_image_embeddings()
+    except Exception as e:
+        logging.error(f"Error processing embeddings: {e}")
+        return jsonify({"error": "Failed to load embeddings"}), 500
 
     similarities = []
 
@@ -90,11 +116,12 @@ def rank_templates():
     # Calculate inter-template similarities
     inter_template_similarities = calculate_inter_template_similarities(ranked_templates, image_embeddings)
 
-    # Print the calculated similarities
+    # Log the calculated similarities
     for template_pair, similarity in inter_template_similarities.items():
-        print(f"Similarity between {template_pair[0]} and {template_pair[1]}: {similarity}")
+        logging.info(f"Similarity between {template_pair[0]} and {template_pair[1]}: {similarity}")
 
     return jsonify({"ranked_templates": ranked_templates})
 
-if __name__ == '__main__':
-    app.run(debug=True)
+# Entry point for Google Cloud Functions
+def main(request):
+    return app(request)
